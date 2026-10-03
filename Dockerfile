@@ -15,10 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 
 # Environment variables (set via Fly.io secrets)
-ENV PORT=8080
 ENV SARVAM_API_KEY=""
 ENV PUBLIC_URL=""
 
 EXPOSE 8080
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD uvicorn server:app --host 0.0.0.0 --port ${PORT:-10000}
