@@ -215,6 +215,23 @@ def mp3_to_mulaw8k(mp3_path: str) -> bytes:
         return b""
 
 
+async def get_btc_price() -> str:
+    """Fetch live BTC/INR price from CoinGecko."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=inr"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                price = data.get("bitcoin", {}).get("inr", 0)
+                if price:
+                    return f"₹{price:,.0f}"
+    except:
+        pass
+    return "unavailable"
+
+
 async def ask_gemini(user_text: str, history: list) -> str:
     """
     Call Google Gemini API (free tier) for natural conversation.
@@ -226,6 +243,9 @@ async def ask_gemini(user_text: str, history: list) -> str:
 
     import httpx
     try:
+        # Fetch live BTC price for context
+        btc_price = await get_btc_price()
+
         # Build conversation context
         system_prompt = (
             "You are Jarvis, Harshit Singh's personal voice assistant. "
@@ -234,6 +254,8 @@ async def ask_gemini(user_text: str, history: list) -> str:
             "Be warm, helpful, and a bit playful. "
             "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
             "and trades crypto (has 0.000059 BTC position). "
+            f"Current live BTC price: {btc_price} INR. "
+            "Use this when he asks about Bitcoin or crypto. "
             "Never mention you are an AI model. You are Jarvis."
         )
 
@@ -319,8 +341,8 @@ def process_command(text: str, call_id: str) -> str:
     elif any(w in text_lower for w in ["bye", "alvida", "rakh", "cut"]):
         response = "Theek hai Harshit, phir baat karte hain. Bye!"
     elif text_lower:
-        # Default: acknowledge and ask
-        response = f"Samajh gaya. Aapne kaha: {text}. Main ispe kaam karunga, thodi der me update dunga."
+        # Default: be honest, don't promise updates we can't deliver
+        response = f"Aapne kaha: {text}. Iske baare me mere paas abhi live data nahi hai."
     else:
         response = "Sunai nahi diya, phir se boliye?"
 
@@ -337,12 +359,19 @@ async def ask_gemini_stream(user_text: str, history: list):
     """
     import re
     try:
+        # Fetch live BTC price for context
+        btc_price = await get_btc_price()
+
         # Build system prompt
         system_prompt = (
             "You are Jarvis, Harshit Singh's personal voice assistant. "
             "You speak Hindi, English, and Hinglish naturally. "
             "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
             "Be warm, helpful, and a bit playful. "
+            "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
+            "and trades crypto (has 0.000059 BTC position). "
+            f"Current live BTC price: {btc_price} INR. "
+            "Use this when he asks about Bitcoin or crypto. "
             "Never mention you are an AI model. You are Jarvis."
         )
 
