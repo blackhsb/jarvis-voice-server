@@ -265,9 +265,25 @@ async def ask_gemini(user_text: str, history: list) -> str:
             )
             if resp.status_code == 200:
                 result = resp.json()
-                text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                logger.info(f"Gemini: {text[:80]}...")
-                return text
+                try:
+                    candidates = result.get("candidates", [])
+                    if not candidates:
+                        logger.warning("Gemini: empty candidates")
+                        return ""
+                    content = candidates[0].get("content", {})
+                    parts = content.get("parts", [])
+                    if not parts:
+                        logger.warning("Gemini: empty parts")
+                        return ""
+                    text = parts[0].get("text", "").strip()
+                    if not text:
+                        logger.warning("Gemini: empty text")
+                        return ""
+                    logger.info(f"Gemini: {text[:80]}...")
+                    return text
+                except (KeyError, IndexError, AttributeError) as e:
+                    logger.error(f"Gemini parse error: {e}, response: {str(result)[:200]}")
+                    return ""
             else:
                 logger.error(f"Gemini failed: {resp.status_code} {resp.text[:200]}")
                 return ""
