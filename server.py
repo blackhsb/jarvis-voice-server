@@ -424,10 +424,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Audio cleared")
                 continue
 
-            # Check for end of speech (0.5 sec silence for low latency)
+            # Check for end of speech (0.3 sec silence for low latency)
             if is_speaking and len(audio_buffer) > 8000:  # >0.5 sec of audio
                 silence_duration = time.time() - last_audio_time
-                if silence_duration > 0.5:  # 0.5 sec silence = end of utterance
+                if silence_duration > 0.3:  # 0.3 sec silence = end of utterance
                     # Process the buffered audio
                     logger.info(f"Processing {len(audio_buffer)} bytes of audio")
                     pcm_bytes = bytes(audio_buffer)
