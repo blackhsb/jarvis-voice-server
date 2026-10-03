@@ -252,7 +252,7 @@ async def ask_gemini(user_text: str, history: list) -> str:
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}",
                 headers={"Content-Type": "application/json"},
                 json={
                     "systemInstruction": {"parts": [{"text": system_prompt}]},
