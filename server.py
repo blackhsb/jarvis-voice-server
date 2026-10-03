@@ -1,55 +1,46 @@
 """
-Jarvis Live Voice Server (Gemini Live API - Native Audio)
+Jarvis Real-time Voice Server
 WebSocket-based bidirectional audio for Vobiz <Stream>
-Architecture: Vobiz audio -> Gemini Live API (native audio) -> Vobiz audio
-No STT/TTS pipeline - Gemini handles audio natively for minimal latency.
+Low-latency pipeline: Audio -> STT -> LLM -> TTS -> Audio
 """
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import time
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 import uvicorn
-import websockets
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("jarvis-live")
+logger = logging.getLogger("jarvis-realtime")
 
-app = FastAPI(title="Jarvis Live Voice Server (Gemini Live API)")
+app = FastAPI(title="Jarvis Real-time Voice Server")
 
 # Config
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # e.g., https://xxx.ngrok-free.app
 VOBIZ_AUTH_ID = os.getenv("VOBIZ_AUTH_ID", "MA_0D6NBKHU")
 
-# Gemini Live API config
-GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
-GEMINI_LIVE_WS_URL = (
-    "wss://generativelanguage.googleapis.com/ws/"
-    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-)
+# Audio config for Vobiz Stream
+# Vobiz sends: audio/x-mulaw;rate=8000
+SAMPLE_RATE = 8000
 
-# Audio config
-VOBIZ_SAMPLE_RATE = 8000   # Vobiz uses mulaw 8kHz
-GEMINI_INPUT_RATE = 16000  # Gemini Live expects PCM16 16kHz input
-GEMINI_OUTPUT_RATE = 24000  # Gemini Live outputs PCM16 24kHz
-
-# Conversation state per call (for logging/transcripts)
+# Conversation state per call
 conversations = {}
-
-# Cached BTC price (updated in background)
-_btc_price_cache = "unavailable"
-_btc_last_fetch = 0
 
 
 def get_public_ws_url() -> str:
     """Get WebSocket URL for Vobiz Stream verb."""
     if PUBLIC_URL:
+        # Convert https:// to wss://
         ws_base = PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://")
         return f"{ws_base}/ws"
     return "wss://localhost/ws"
@@ -57,20 +48,25 @@ def get_public_ws_url() -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "jarvis-live"}
+    return {"status": "ok", "service": "jarvis-realtime"}
 
 
 @app.api_route("/answer", methods=["GET", "POST"])
 async def answer(request: Request):
-    """Vobiz calls this when the call is answered. Returns Stream XML."""
+    """
+    Vobiz calls this when the call is answered.
+    Returns XML with <Stream> for bidirectional audio.
+    """
     ws_url = get_public_ws_url()
     logger.info(f"Call answered, streaming to: {ws_url}")
+
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Stream bidirectional="true" audioTrack="inbound" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">
         {ws_url}
     </Stream>
 </Response>"""
+
     return Response(content=xml, media_type="text/xml")
 
 
@@ -86,26 +82,159 @@ def pcm16_to_mulaw(pcm_bytes: bytes) -> bytes:
     return audioop.lin2ulaw(pcm_bytes, 2)
 
 
-def upsample_8k_to_16k(pcm8k: bytes) -> bytes:
-    """Upsample PCM16 8kHz mono to PCM16 16kHz mono."""
-    import audioop
-    out, _ = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, None)
-    return out
+async def transcribe_with_sarvam(audio_pcm16: bytes) -> str:
+    """
+    Transcribe PCM16 8kHz audio using Sarvam STT.
+    Returns transcribed text.
+    """
+    if not SARVAM_API_KEY:
+        logger.warning("SARVAM_API_KEY not set, STT skipped")
+        return ""
+
+    # Sarvam STT expects WAV file
+    # Create WAV in memory: 8kHz, 16-bit, mono
+    import wave
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(audio_pcm16)
+    wav_buffer.seek(0)
+
+    # Call Sarvam API
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            files = {"file": ("audio.wav", wav_buffer, "audio/wav")}
+            data = {
+                "model": "saarika:v2.5",
+                "language_code": "hi-IN",  # Hindi + English
+            }
+            headers = {"api-subscription-key": SARVAM_API_KEY}
+
+            resp = await client.post(
+                "https://api.sarvam.ai/speech-to-text",
+                files=files,
+                data=data,
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                text = result.get("transcript", "")
+                logger.info(f"STT: {text}")
+                return text
+            else:
+                logger.error(f"Sarvam STT failed: {resp.status_code} {resp.text[:200]}")
+                return ""
+    except Exception as e:
+        logger.error(f"STT error: {e}")
+        return ""
 
 
-def downsample_24k_to_8k(pcm24k: bytes) -> bytes:
-    """Downsample PCM16 24kHz mono to PCM16 8kHz mono."""
-    import audioop
-    out, _ = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, None)
-    return out
+async def generate_sarvam_tts(text: str, output_path: str) -> bool:
+    """
+    Generate speech using Sarvam TTS (bulbul:v3).
+    Returns True on success.
+    """
+    if not SARVAM_API_KEY:
+        logger.warning("SARVAM_API_KEY not set, TTS skipped")
+        return False
 
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Sarvam TTS API
+            data = {
+                "text": text,
+                "target_language_code": "hi-IN",
+                "speaker": "kabir",  # More natural, engaging voice
+                "model": "bulbul:v3",
+            }
+            headers = {
+                "api-subscription-key": SARVAM_API_KEY,
+                "Content-Type": "application/json",
+            }
+
+            resp = await client.post(
+                "https://api.sarvam.ai/text-to-speech",
+                json=data,
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                # Sarvam returns base64 audio
+                audio_b64 = result.get("audios", [None])[0]
+                if audio_b64:
+                    audio_bytes = base64.b64decode(audio_b64)
+                    with open(output_path, "wb") as f:
+                        f.write(audio_bytes)
+                    size = os.path.getsize(output_path)
+                    logger.info(f"Sarvam TTS generated: {size} bytes")
+                    return size > 1000
+                else:
+                    logger.error("Sarvam TTS: no audio in response")
+                    return False
+            else:
+                logger.error(f"Sarvam TTS failed: {resp.status_code} {resp.text[:200]}")
+                return False
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return False
+
+
+def generate_magnus_tts(text: str, output_path: str) -> bool:
+    """
+    DEPRECATED: Magnus voice only works in Muse workspace.
+    Use generate_sarvam_tts instead for deployable TTS.
+    """
+    logger.warning("Magnus TTS not available outside workspace, using Sarvam")
+    return False
+
+
+def mp3_to_mulaw8k(mp3_path: str) -> bytes:
+    """
+    Convert MP3 to mulaw 8kHz bytes for Vobiz Stream.
+    Uses ffmpeg.
+    """
+    try:
+        # Convert MP3 -> raw mulaw 8kHz mono
+        cmd = [
+            "ffmpeg", "-y", "-i", mp3_path,
+            "-ar", "8000", "-ac", "1",
+            "-f", "mulaw", "-",
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            logger.error(f"ffmpeg failed: {result.stderr.decode()[:200]}")
+            return b""
+    except Exception as e:
+        logger.error(f"Audio convert error: {e}")
+        return b""
+
+
+# Cached BTC price (updated in background, never blocks)
+_btc_price_cache = "unavailable"
+_btc_last_fetch = 0
+
+async def get_btc_price() -> str:
+    """Get cached BTC price (fast, never blocks). Updates in background every 60s."""
+    global _btc_price_cache, _btc_last_fetch
+    import time
+    now = time.time()
+    # Update cache in background if stale (don't await)
+    if now - _btc_last_fetch > 60:
+        _btc_last_fetch = now
+        asyncio.create_task(_fetch_btc_price())
+    return _btc_price_cache
 
 async def _fetch_btc_price():
     """Background task to update BTC price cache."""
     global _btc_price_cache
-    import httpx
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
                 "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=inr"
             )
@@ -114,279 +243,259 @@ async def _fetch_btc_price():
                 price = data.get("bitcoin", {}).get("inr", 0)
                 if price:
                     _btc_price_cache = f"₹{price:,.0f}"
-                    logger.info(f"BTC price updated: {_btc_price_cache}")
-    except Exception as e:
-        logger.warning(f"BTC price fetch failed: {e}")
+    except:
+        pass
 
 
-async def get_btc_price() -> str:
-    """Get cached BTC price (fast, never blocks). Refresh in background if stale."""
-    global _btc_last_fetch
-    now = time.time()
-    if now - _btc_last_fetch > 60:
-        _btc_last_fetch = now
-        asyncio.create_task(_fetch_btc_price())
-    return _btc_price_cache
-
-
-def build_system_instruction(btc_price: str) -> str:
-    return (
-        "You are Jarvis, Harshit Singh's personal voice assistant. "
-        "You speak Hindi, English, and Hinglish naturally. "
-        "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
-        "Be warm, helpful, and a bit playful. "
-        "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
-        "and trades crypto (has 0.000059 BTC position). "
-        f"Current live BTC price: {btc_price} INR. "
-        "Use this when he asks about Bitcoin or crypto. "
-        "Never mention you are an AI model. You are Jarvis."
-    )
-
-
-class GeminiLiveSession:
+async def ask_gemini(user_text: str, history: list) -> str:
     """
-    Manages a Gemini Live API WebSocket session.
-    Forwards Vobiz audio to Gemini, forwards Gemini audio back to Vobiz.
+    Call Google Gemini API (free tier) for natural conversation.
+    Returns the assistant's reply text.
     """
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set, LLM skipped")
+        return ""
 
-    def __init__(self, vobiz_ws: WebSocket, call_id: str, stream_id: Optional[str]):
-        self.vobiz_ws = vobiz_ws
-        self.call_id = call_id
-        self.stream_id = stream_id
-        self.gemini_ws = None
-        self.running = False
-        self._recv_task = None
-        self._send_lock = asyncio.Lock()
-        # Buffer for outgoing audio pacing
-        self._audio_queue = asyncio.Queue()
+    import httpx
+    try:
+        # Fetch live BTC price for context
+        btc_price = await get_btc_price()
 
-    async def connect(self) -> bool:
-        """Connect to Gemini Live API and send setup."""
-        if not GEMINI_API_KEY:
-            logger.error("GEMINI_API_KEY not set, cannot connect to Gemini Live")
-            return False
+        # Build conversation context
+        system_prompt = (
+            "You are Jarvis, Harshit Singh's personal voice assistant. "
+            "You speak Hindi, English, and Hinglish naturally. "
+            "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
+            "Be warm, helpful, and a bit playful. "
+            "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
+            "and trades crypto (has 0.000059 BTC position). "
+            f"Current live BTC price: {btc_price} INR. "
+            "Use this when he asks about Bitcoin or crypto. "
+            "Never mention you are an AI model. You are Jarvis."
+        )
 
-        try:
-            url = f"{GEMINI_LIVE_WS_URL}?key={GEMINI_API_KEY}"
-            self.gemini_ws = await websockets.connect(
-                url,
-                max_size=10 * 1024 * 1024,
-                ping_interval=20,
-                ping_timeout=20,
-            )
-            logger.info("Connected to Gemini Live API")
+        # Build contents with history
+        contents = []
+        for msg in history[-8:]:  # Last 8 messages for context
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append({
+                "role": role,
+                "parts": [{"text": msg["content"]}]
+            })
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_text}]
+        })
 
-            # Build setup message (must be first message)
-            btc_price = await get_btc_price()
-            setup_msg = {
-                "setup": {
-                    "model": f"models/{GEMINI_LIVE_MODEL}",
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": contents,
                     "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": "Aoede"
-                                }
-                            }
-                        }
+                        "maxOutputTokens": 100,  # Keep short for voice
+                        "temperature": 0.7,
                     },
-                    "systemInstruction": {
-                        "parts": [{"text": build_system_instruction(btc_price)}]
-                    },
-                    "inputAudioTranscription": {},
-                    "outputAudioTranscription": {},
-                    "realtimeInputConfig": {
-                        "automaticActivityDetection": {
-                            "disabled": False
-                        }
-                    }
-                }
-            }
-            await self.gemini_ws.send(json.dumps(setup_msg))
-            logger.info("Gemini Live setup sent, waiting for confirmation...")
-
-            # Wait for setupComplete
-            async with asyncio.timeout(15):
-                async for msg in self.gemini_ws:
-                    data = json.loads(msg)
-                    if "setupComplete" in data:
-                        logger.info("Gemini Live setup complete")
-                        break
-                    # Handle any early messages
-                    logger.debug(f"Pre-setup message: {str(data)[:100]}")
-
-            self.running = True
-            self._recv_task = asyncio.create_task(self._receive_loop())
-            return True
-
-        except Exception as e:
-            logger.error(f"Gemini Live connect failed: {e}")
-            return False
-
-    async def _receive_loop(self):
-        """Receive messages from Gemini Live API and forward audio to Vobiz."""
-        try:
-            async for msg in self.gemini_ws:
-                if not self.running:
-                    break
+                },
+            )
+            if resp.status_code == 200:
+                result = resp.json()
                 try:
-                    data = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
+                    candidates = result.get("candidates", [])
+                    if not candidates:
+                        logger.warning("Gemini: empty candidates")
+                        return ""
+                    content = candidates[0].get("content", {})
+                    parts = content.get("parts", [])
+                    if not parts:
+                        logger.warning("Gemini: empty parts")
+                        return ""
+                    text = parts[0].get("text", "").strip()
+                    if not text:
+                        logger.warning("Gemini: empty text")
+                        return ""
+                    logger.info(f"Gemini: {text[:80]}...")
+                    return text
+                except (KeyError, IndexError, AttributeError) as e:
+                    logger.error(f"Gemini parse error: {e}, response: {str(result)[:200]}")
+                    return ""
+            else:
+                logger.error(f"Gemini failed: {resp.status_code} {resp.text[:200]}")
+                return ""
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return ""
 
-                # Handle server content (audio output, transcriptions)
-                server_content = data.get("serverContent")
-                if server_content:
-                    # Audio output
-                    model_turn = server_content.get("modelTurn", {})
-                    for part in model_turn.get("parts", []):
-                        inline_data = part.get("inlineData", {})
-                        if inline_data and inline_data.get("mimeType", "").startswith("audio/"):
-                            audio_b64 = inline_data.get("data", "")
-                            if audio_b64:
-                                pcm24k = base64.b64decode(audio_b64)
-                                await self._forward_audio_to_vobiz(pcm24k)
 
-                    # Transcriptions (for logging)
-                    input_trans = server_content.get("inputTranscription", {})
-                    if input_trans.get("text"):
-                        logger.info(f"User said: {input_trans['text']}")
+def process_command(text: str, call_id: str) -> str:
+    """
+    Process user speech and generate response.
+    This is where Muse LLM integration goes.
+    For now: simple rule-based + personalized responses.
+    """
+    text_lower = text.lower().strip()
 
-                    output_trans = server_content.get("outputTranscription", {})
-                    if output_trans.get("text"):
-                        logger.info(f"Jarvis said: {output_trans['text']}")
+    # Get conversation history
+    history = conversations.get(call_id, [])
+    history.append({"role": "user", "content": text})
 
-                    # Turn complete
-                    if server_content.get("turnComplete"):
-                        logger.debug("Turn complete")
+    # Simple responses (will be replaced with full LLM)
+    response = ""
+    if any(w in text_lower for w in ["hello", "namaste", "sat sri", "hey"]):
+        response = "Namaste Harshit! Main Jarvis hun. Boliye, kya karna hai?"
+    elif any(w in text_lower for w in ["time", "samay", "baj"]):
+        from datetime import datetime
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(ist)
+        response = f"Abhi {now.strftime('%I:%M %p')} ho rahe hain."
+    elif any(w in text_lower for w in ["bitcoin", "btc", "crypto"]):
+        response = "Aapka Bitcoin position khula hai. 0.000059 BTC, entry 84 lakh 3 hazaar. Stop 82 lakh 30 hazaar, target 86 lakh 90 hazaar."
+    elif any(w in text_lower for w in ["bye", "alvida", "rakh", "cut"]):
+        response = "Theek hai Harshit, phir baat karte hain. Bye!"
+    elif text_lower:
+        # Default: be honest, don't promise updates we can't deliver
+        response = f"Aapne kaha: {text}. Iske baare me mere paas abhi live data nahi hai."
+    else:
+        response = "Sunai nahi diya, phir se boliye?"
 
-                # Handle interruption (user started speaking)
-                if data.get("serverContent", {}).get("interrupted"):
-                    logger.info("Gemini interrupted (barge-in detected)")
-                    # Clear Vobiz audio buffer so stale audio doesn't play
-                    await self._clear_vobiz_audio()
+    history.append({"role": "assistant", "content": response})
+    conversations[call_id] = history
 
-                # Handle GoAway (server asking us to reconnect)
-                if "goAway" in data:
-                    logger.warning(f"Gemini sent GoAway: {data['goAway']}")
-                    break
+    return response
 
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"Gemini Live connection closed: {e}")
-        except Exception as e:
-            logger.error(f"Gemini Live receive loop error: {e}")
-        finally:
-            self.running = False
 
-    async def _forward_audio_to_vobiz(self, pcm24k: bytes):
-        """Convert Gemini PCM24k audio to mulaw 8kHz and stream to Vobiz."""
-        try:
-            # Downsample 24kHz -> 8kHz, then convert to mulaw
-            pcm8k = downsample_24k_to_8k(pcm24k)
-            mulaw = pcm16_to_mulaw(pcm8k)
+async def ask_gemini_stream(user_text: str, history: list):
+    """
+    Ask Gemini using streaming - yields text chunks as they arrive.
+    This enables sentence-by-sentence TTS for lower perceived latency.
+    """
+    import re
+    try:
+        # Fetch live BTC price for context
+        btc_price = await get_btc_price()
 
-            # Stream in 20ms chunks (160 bytes at 8kHz mulaw)
-            chunk_size = 160
-            for i in range(0, len(mulaw), chunk_size):
-                if not self.running:
-                    break
-                chunk = mulaw[i:i + chunk_size]
-                payload = base64.b64encode(chunk).decode()
-                msg = {
-                    "event": "playAudio",
-                    "media": {
-                        "contentType": "audio/x-mulaw",
-                        "sampleRate": 8000,
-                        "payload": payload
-                    }
-                }
-                async with self._send_lock:
-                    await self.vobiz_ws.send_text(json.dumps(msg))
-                # Real-time pacing
-                await asyncio.sleep(0.02)
+        # Build system prompt
+        system_prompt = (
+            "You are Jarvis, Harshit Singh's personal voice assistant. "
+            "You speak Hindi, English, and Hinglish naturally. "
+            "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
+            "Be warm, helpful, and a bit playful. "
+            "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
+            "and trades crypto (has 0.000059 BTC position). "
+            f"Current live BTC price: {btc_price} INR. "
+            "Use this when he asks about Bitcoin or crypto. "
+            "Never mention you are an AI model. You are Jarvis."
+        )
 
-        except Exception as e:
-            logger.error(f"Error forwarding audio to Vobiz: {e}")
+        # Build contents with history
+        contents = []
+        for msg in history[-8:]:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append({
+                "role": role,
+                "parts": [{"text": msg["content"]}]
+            })
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_text}]
+        })
 
-    async def _clear_vobiz_audio(self):
-        """Send clearAudio to Vobiz to stop stale playback on barge-in."""
-        try:
-            msg = {
-                "event": "clearAudio",
-                "streamId": self.stream_id,
-            }
-            async with self._send_lock:
-                await self.vobiz_ws.send_text(json.dumps(msg))
-            logger.info("Sent clearAudio to Vobiz (barge-in)")
-        except Exception as e:
-            logger.error(f"Error sending clearAudio: {e}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream(
+                "POST",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:streamGenerateContent?key={GEMINI_API_KEY}&alt=sse",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": 100,
+                        "temperature": 0.7,
+                    },
+                },
+            ) as resp:
+                if resp.status_code != 200:
+                    logger.error(f"Gemini stream failed: {resp.status_code}")
+                    return
 
-    async def send_audio(self, pcm8k: bytes):
-        """Forward Vobiz PCM16 8kHz audio to Gemini Live API (upsampled to 16kHz)."""
-        if not self.gemini_ws or not self.running:
-            return
-        try:
-            # Upsample 8kHz -> 16kHz for Gemini
-            pcm16k = upsample_8k_to_16k(pcm8k)
-            audio_b64 = base64.b64encode(pcm16k).decode()
-            msg = {
-                "realtimeInput": {
-                    "mediaChunks": [
-                        {
-                            "mimeType": "audio/pcm;rate=16000",
-                            "data": audio_b64
-                        }
-                    ]
-                }
-            }
-            await self.gemini_ws.send(json.dumps(msg))
-        except Exception as e:
-            logger.error(f"Error sending audio to Gemini: {e}")
+                buffer = ""
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        data = json.loads(line[6:])
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                chunk = parts[0].get("text", "")
+                                if chunk:
+                                    buffer += chunk
+                                    # Yield complete sentences
+                                    sentences = re.split(r'(?<=[.!?])\s+', buffer)
+                                    if len(sentences) > 1:
+                                        for s in sentences[:-1]:
+                                            if s.strip():
+                                                yield s.strip()
+                                        buffer = sentences[-1]
+                    except:
+                        continue
 
-    async def send_greeting(self, text: str):
-        """Send initial text greeting - Gemini will speak it."""
-        if not self.gemini_ws or not self.running:
-            return
-        try:
-            msg = {
-                "clientContent": {
-                    "turns": [
-                        {
-                            "role": "user",
-                            "parts": [{"text": f"Please greet me with: {text}"}]
-                        }
-                    ],
-                    "turnComplete": True
-                }
-            }
-            await self.gemini_ws.send(json.dumps(msg))
-            logger.info("Greeting sent to Gemini Live")
-        except Exception as e:
-            logger.error(f"Error sending greeting: {e}")
+                # Yield remaining buffer
+                if buffer.strip():
+                    yield buffer.strip()
 
-    async def close(self):
-        """Close the Gemini Live session."""
-        self.running = False
-        if self._recv_task:
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
-        if self.gemini_ws:
-            try:
-                await self.gemini_ws.close()
-            except:
-                pass
-        logger.info("Gemini Live session closed")
+    except Exception as e:
+        logger.error(f"Gemini stream error: {e}")
+        return
+
+
+async def process_command_llm(text: str, call_id: str) -> str:
+    """
+    Process user speech using Google Gemini LLM with conversation history.
+    Falls back to rule-based if LLM fails.
+    """
+    # Get conversation history
+    history = conversations.get(call_id, [])
+
+    # Try Gemini LLM
+    response = await ask_gemini(text, history)
+    if response:
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": response})
+        conversations[call_id] = history
+        return response
+
+    # Fallback to rule-based
+    logger.warning("Gemini failed, using rule-based fallback")
+    return process_command(text, call_id)
+
+
+def is_speech(pcm16_bytes: bytes, threshold: int = 500) -> bool:
+    """
+    Simple energy-based Voice Activity Detection.
+    Returns True if the audio frame contains speech (not silence).
+    """
+    import audioop
+    if not pcm16_bytes:
+        return False
+    # Calculate RMS energy of the audio frame
+    try:
+        rms = audioop.rms(pcm16_bytes, 2)  # 2 = 16-bit samples
+        return rms > threshold
+    except:
+        return False
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
     Bidirectional audio WebSocket for Vobiz Stream.
-    Forwards audio between Vobiz and Gemini Live API (native audio, no STT/TTS).
+    Vobiz sends: start (with nested streamId/callId), media, playedStream, clearedAudio
+    We send back: playAudio, checkpoint, clearAudio, stop
     """
     await websocket.accept()
     call_id = f"call_{int(time.time())}"
@@ -395,77 +504,146 @@ async def websocket_endpoint(websocket: WebSocket):
 
     logger.info(f"WebSocket connected: {call_id}")
 
-    # Create Gemini Live session
-    session = GeminiLiveSession(websocket, call_id, stream_id)
+    # Audio buffer for incoming speech
+    audio_buffer = bytearray()
+    last_audio_time = time.time()
+    is_speaking = False
 
     try:
-        # Wait for 'start' event to get stream_id
-        message = await websocket.receive_text()
-        data = json.loads(message)
-        if data.get("event") == "start":
-            start_data = data.get("start", {})
-            stream_id = start_data.get("streamId")
-            session.stream_id = stream_id
-            vobiz_call_id = start_data.get("callId")
-            logger.info(f"Stream started: streamId={stream_id}, callId={vobiz_call_id}")
-
-        # Connect to Gemini Live API
-        if not await session.connect():
-            logger.error("Failed to connect to Gemini Live API, closing call")
-            await websocket.close()
-            return
-
-        # Send greeting (Gemini will speak it natively)
-        greeting = "Namaste Harshit! Main Jarvis hun, aapka personal assistant. Boliye, kya karna hai?"
-        await session.send_greeting(greeting)
-
-        # Audio forwarding loop: Vobiz -> Gemini
-        # Buffer small chunks to reduce WebSocket overhead (~100ms = 1600 bytes PCM16 8kHz)
-        audio_buffer = bytearray()
-        BUFFER_SIZE = 1600  # 100ms of PCM16 8kHz audio
-
         while True:
             message = await websocket.receive_text()
             data = json.loads(message)
             event = data.get("event")
 
-            if event == "media":
+            if event == "start":
+                # IDs are NESTED: data.start.streamId, data.start.callId
+                start_data = data.get("start", {})
+                stream_id = start_data.get("streamId")
+                vobiz_call_id = start_data.get("callId")
+                logger.info(f"Stream started: streamId={stream_id}, callId={vobiz_call_id}")
+                # Send greeting AFTER start event (Vobiz is ready now)
+                greeting = "Namaste Harshit! Main Magnus hun, aapka personal assistant. Boliye, kya karna hai?"
+                await speak_text(websocket, greeting, call_id, stream_id)
+                continue
+
+            elif event == "media":
+                # Incoming audio from caller (base64 mulaw 8kHz)
                 payload = data.get("media", {}).get("payload", "")
                 if payload:
                     mulaw_bytes = base64.b64decode(payload)
-                    pcm16_8k = mulaw_to_pcm16(mulaw_bytes)
-                    audio_buffer.extend(pcm16_8k)
-
-                    # Forward buffered audio to Gemini when we have enough
-                    while len(audio_buffer) >= BUFFER_SIZE:
-                        chunk = bytes(audio_buffer[:BUFFER_SIZE])
-                        del audio_buffer[:BUFFER_SIZE]
-                        await session.send_audio(chunk)
+                    pcm16 = mulaw_to_pcm16(mulaw_bytes)
+                    # Only buffer and update speech timer if actual speech detected
+                    # (Vobiz sends media continuously, even during silence)
+                    if is_speech(pcm16):
+                        audio_buffer.extend(pcm16)
+                        last_audio_time = time.time()
+                        is_speaking = True
 
             elif event == "playedStream":
-                logger.debug(f"Audio played: {data.get('name')}")
+                logger.info(f"Audio played: {data.get('name')}")
                 continue
 
             elif event == "clearedAudio":
-                logger.info("Audio cleared by Vobiz")
+                logger.info("Audio cleared")
                 continue
 
-            elif event == "stop":
-                logger.info("Vobiz sent stop event")
-                break
+            # Check for end of speech (0.3 sec silence for low latency)
+            if is_speaking and len(audio_buffer) > 8000:  # >0.5 sec of audio
+                silence_duration = time.time() - last_audio_time
+                if silence_duration > 0.3:  # 0.3 sec silence = end of utterance
+                    # Process the buffered audio
+                    logger.info(f"Processing {len(audio_buffer)} bytes of audio")
+                    pcm_bytes = bytes(audio_buffer)
+                    audio_buffer.clear()
+                    is_speaking = False
 
-        # Flush remaining buffered audio
-        if audio_buffer:
-            await session.send_audio(bytes(audio_buffer))
+                    # STT
+                    text = await transcribe_with_sarvam(pcm_bytes)
+                    if text:
+                        # Streaming LLM -> Speak sentences as they arrive (low latency)
+                        history = conversations.get(call_id, [])
+                        full_response = ""
+                        sentence_count = 0
+                        async for sentence in ask_gemini_stream(text, history):
+                            if sentence:
+                                full_response += sentence + " "
+                                sentence_count += 1
+                                logger.info(f"Streaming sentence {sentence_count}: {sentence[:50]}...")
+                                await speak_text(websocket, sentence, call_id, stream_id)
+
+                        # Update conversation history
+                        if full_response:
+                            history.append({"role": "user", "content": text})
+                            history.append({"role": "assistant", "content": full_response.strip()})
+                            conversations[call_id] = history
+                        else:
+                            # Fallback if streaming failed
+                            logger.warning("Gemini stream empty, using fallback")
+                            response = process_command(text, call_id)
+                            await speak_text(websocket, response, call_id, stream_id)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {call_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        await session.close()
         if call_id in conversations:
             del conversations[call_id]
+
+
+async def speak_text(websocket: WebSocket, text: str, call_id: str, stream_id: str = None):
+    """Generate Sarvam TTS and stream to caller via WebSocket using playAudio."""
+    logger.info(f"Speaking: {text[:50]}...")
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+        mp3_path = tf.name
+
+    try:
+        # Generate Sarvam audio (async)
+        if not await generate_sarvam_tts(text, mp3_path):
+            logger.error("TTS generation failed")
+            return
+
+        # Convert to mulaw 8kHz
+        mulaw_bytes = mp3_to_mulaw8k(mp3_path)
+        if not mulaw_bytes:
+            logger.error("Audio conversion failed")
+            return
+
+        # Stream in chunks (20ms = 160 bytes at 8kHz mulaw)
+        # Vobiz expects: {event: "playAudio", media: {contentType, sampleRate, payload}}
+        chunk_size = 160
+        for i in range(0, len(mulaw_bytes), chunk_size):
+            chunk = mulaw_bytes[i:i+chunk_size]
+            payload = base64.b64encode(chunk).decode()
+
+            msg = {
+                "event": "playAudio",
+                "media": {
+                    "contentType": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "payload": payload
+                }
+            }
+            await websocket.send_text(json.dumps(msg))
+
+            # Real-time pacing: 20ms per chunk
+            await asyncio.sleep(0.02)
+
+        # Send checkpoint to mark end of utterance
+        if stream_id:
+            checkpoint_msg = {
+                "event": "checkpoint",
+                "streamId": stream_id,
+                "name": f"utterance_{int(time.time())}"
+            }
+            await websocket.send_text(json.dumps(checkpoint_msg))
+
+        logger.info(f"Finished speaking ({len(mulaw_bytes)} bytes)")
+
+    finally:
+        if os.path.exists(mp3_path):
+            os.unlink(mp3_path)
 
 
 if __name__ == "__main__":
