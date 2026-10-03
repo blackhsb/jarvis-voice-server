@@ -330,6 +330,85 @@ def process_command(text: str, call_id: str) -> str:
     return response
 
 
+async def ask_gemini_stream(user_text: str, history: list):
+    """
+    Ask Gemini using streaming - yields text chunks as they arrive.
+    This enables sentence-by-sentence TTS for lower perceived latency.
+    """
+    import re
+    try:
+        # Build system prompt
+        system_prompt = (
+            "You are Jarvis, Harshit Singh's personal voice assistant. "
+            "You speak Hindi, English, and Hinglish naturally. "
+            "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
+            "Be warm, helpful, and a bit playful. "
+            "Never mention you are an AI model. You are Jarvis."
+        )
+
+        # Build contents with history
+        contents = []
+        for msg in history[-8:]:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append({
+                "role": role,
+                "parts": [{"text": msg["content"]}]
+            })
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_text}]
+        })
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream(
+                "POST",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:streamGenerateContent?key={GEMINI_API_KEY}&alt=sse",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": 100,
+                        "temperature": 0.7,
+                    },
+                },
+            ) as resp:
+                if resp.status_code != 200:
+                    logger.error(f"Gemini stream failed: {resp.status_code}")
+                    return
+
+                buffer = ""
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        data = json.loads(line[6:])
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                chunk = parts[0].get("text", "")
+                                if chunk:
+                                    buffer += chunk
+                                    # Yield complete sentences
+                                    sentences = re.split(r'(?<=[.!?])\s+', buffer)
+                                    if len(sentences) > 1:
+                                        for s in sentences[:-1]:
+                                            if s.strip():
+                                                yield s.strip()
+                                        buffer = sentences[-1]
+                    except:
+                        continue
+
+                # Yield remaining buffer
+                if buffer.strip():
+                    yield buffer.strip()
+
+    except Exception as e:
+        logger.error(f"Gemini stream error: {e}")
+        return
+
+
 async def process_command_llm(text: str, call_id: str) -> str:
     """
     Process user speech using Google Gemini LLM with conversation history.
@@ -437,10 +516,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     # STT
                     text = await transcribe_with_sarvam(pcm_bytes)
                     if text:
-                        # LLM -> Response (Grok with fallback)
-                        response = await process_command_llm(text, call_id)
-                        # TTS -> Speak
-                        await speak_text(websocket, response, call_id, stream_id)
+                        # Streaming LLM -> Speak sentences as they arrive (low latency)
+                        history = conversations.get(call_id, [])
+                        full_response = ""
+                        sentence_count = 0
+                        async for sentence in ask_gemini_stream(text, history):
+                            if sentence:
+                                full_response += sentence + " "
+                                sentence_count += 1
+                                logger.info(f"Streaming sentence {sentence_count}: {sentence[:50]}...")
+                                await speak_text(websocket, sentence, call_id, stream_id)
+
+                        # Update conversation history
+                        if full_response:
+                            history.append({"role": "user", "content": text})
+                            history.append({"role": "assistant", "content": full_response.strip()})
+                            conversations[call_id] = history
+                        else:
+                            # Fallback if streaming failed
+                            logger.warning("Gemini stream empty, using fallback")
+                            response = process_command(text, call_id)
+                            await speak_text(websocket, response, call_id, stream_id)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {call_id}")
