@@ -215,10 +215,26 @@ def mp3_to_mulaw8k(mp3_path: str) -> bytes:
         return b""
 
 
+# Cached BTC price (updated in background, never blocks)
+_btc_price_cache = "unavailable"
+_btc_last_fetch = 0
+
 async def get_btc_price() -> str:
-    """Fetch live BTC/INR price from CoinGecko."""
+    """Get cached BTC price (fast, never blocks). Updates in background every 60s."""
+    global _btc_price_cache, _btc_last_fetch
+    import time
+    now = time.time()
+    # Update cache in background if stale (don't await)
+    if now - _btc_last_fetch > 60:
+        _btc_last_fetch = now
+        asyncio.create_task(_fetch_btc_price())
+    return _btc_price_cache
+
+async def _fetch_btc_price():
+    """Background task to update BTC price cache."""
+    global _btc_price_cache
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
                 "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=inr"
             )
@@ -226,10 +242,9 @@ async def get_btc_price() -> str:
                 data = resp.json()
                 price = data.get("bitcoin", {}).get("inr", 0)
                 if price:
-                    return f"₹{price:,.0f}"
+                    _btc_price_cache = f"₹{price:,.0f}"
     except:
         pass
-    return "unavailable"
 
 
 async def ask_gemini(user_text: str, history: list) -> str:
