@@ -25,6 +25,7 @@ app = FastAPI(title="Jarvis Real-time Voice Server")
 
 # Config
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # e.g., https://xxx.ngrok-free.app
 VOBIZ_AUTH_ID = os.getenv("VOBIZ_AUTH_ID", "MA_0D6NBKHU")
 
@@ -214,6 +215,44 @@ def mp3_to_mulaw8k(mp3_path: str) -> bytes:
         return b""
 
 
+async def ask_grok(messages: list) -> str:
+    """
+    Call xAI Grok API for natural conversation.
+    Returns the assistant's reply text.
+    """
+    if not XAI_API_KEY:
+        logger.warning("XAI_API_KEY not set, LLM skipped")
+        return ""
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {XAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "grok-4-1-fast-non-reasoning",
+                    "messages": messages,
+                    "max_tokens": 150,  # Keep responses short for low latency
+                    "temperature": 0.7,
+                },
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                text = result["choices"][0]["message"]["content"].strip()
+                logger.info(f"Grok: {text[:80]}...")
+                return text
+            else:
+                logger.error(f"xAI Grok failed: {resp.status_code} {resp.text[:200]}")
+                return ""
+    except Exception as e:
+        logger.error(f"Grok error: {e}")
+        return ""
+
+
 def process_command(text: str, call_id: str) -> str:
     """
     Process user speech and generate response.
@@ -229,7 +268,7 @@ def process_command(text: str, call_id: str) -> str:
     # Simple responses (will be replaced with full LLM)
     response = ""
     if any(w in text_lower for w in ["hello", "namaste", "sat sri", "hey"]):
-        response = "Namaste Harshit! Main Magnus hun. Boliye, kya karna hai?"
+        response = "Namaste Harshit! Main Jarvis hun. Boliye, kya karna hai?"
     elif any(w in text_lower for w in ["time", "samay", "baj"]):
         from datetime import datetime
         import pytz
@@ -250,6 +289,47 @@ def process_command(text: str, call_id: str) -> str:
     conversations[call_id] = history
 
     return response
+
+
+async def process_command_llm(text: str, call_id: str) -> str:
+    """
+    Process user speech using xAI Grok LLM with conversation history.
+    Falls back to rule-based if LLM fails.
+    """
+    # Get conversation history
+    history = conversations.get(call_id, [])
+
+    # Build messages for Grok with system prompt
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Jarvis, Harshit Singh's personal voice assistant. "
+                "You speak Hindi, English, and Hinglish naturally. "
+                "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
+                "Be warm, helpful, and a bit playful. "
+                "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
+                "and trades crypto (has 0.000059 BTC position). "
+                "Never mention you are an AI model. You are Jarvis."
+            )
+        }
+    ]
+    # Add conversation history (last 10 messages to keep context small)
+    for msg in history[-10:]:
+        messages.append(msg)
+    messages.append({"role": "user", "content": text})
+
+    # Try Grok LLM
+    response = await ask_grok(messages)
+    if response:
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": response})
+        conversations[call_id] = history
+        return response
+
+    # Fallback to rule-based
+    logger.warning("Grok failed, using rule-based fallback")
+    return process_command(text, call_id)
 
 
 def is_speech(pcm16_bytes: bytes, threshold: int = 500) -> bool:
@@ -325,10 +405,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Audio cleared")
                 continue
 
-            # Check for end of speech (silence detection - simplified)
+            # Check for end of speech (0.5 sec silence for low latency)
             if is_speaking and len(audio_buffer) > 8000:  # >0.5 sec of audio
                 silence_duration = time.time() - last_audio_time
-                if silence_duration > 1.0:  # 1 sec silence = end of utterance
+                if silence_duration > 0.5:  # 0.5 sec silence = end of utterance
                     # Process the buffered audio
                     logger.info(f"Processing {len(audio_buffer)} bytes of audio")
                     pcm_bytes = bytes(audio_buffer)
@@ -338,8 +418,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     # STT
                     text = await transcribe_with_sarvam(pcm_bytes)
                     if text:
-                        # LLM -> Response
-                        response = process_command(text, call_id)
+                        # LLM -> Response (Grok with fallback)
+                        response = await process_command_llm(text, call_id)
                         # TTS -> Speak
                         await speak_text(websocket, response, call_id, stream_id)
 
