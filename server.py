@@ -148,7 +148,7 @@ async def generate_sarvam_tts(text: str, output_path: str) -> bool:
             data = {
                 "text": text,
                 "target_language_code": "hi-IN",
-                "speaker": "shubh",  # Deep voice - will verify
+                "speaker": "kabir",  # More natural, engaging voice
                 "model": "bulbul:v3",
             }
             headers = {
