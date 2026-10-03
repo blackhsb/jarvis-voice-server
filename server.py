@@ -17,6 +17,7 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response, JSONResponse
 import uvicorn
+import websockets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jarvis-realtime")
@@ -230,6 +231,116 @@ async def get_btc_price() -> str:
     except:
         pass
     return "unavailable"
+
+
+class SarvamStreamingSTT:
+    """
+    Manages persistent WebSocket connection to Sarvam streaming STT.
+    Streams audio chunks and receives real-time transcripts.
+    """
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.ws = None
+        self.transcript_queue = asyncio.Queue()
+        self.running = False
+        self._listen_task = None
+
+    async def connect(self):
+        """Connect to Sarvam streaming STT WebSocket."""
+        if not self.api_key:
+            logger.warning("SARVAM_API_KEY not set, streaming STT disabled")
+            return False
+
+        try:
+            url = (
+                "wss://api.sarvam.ai/speech-to-text/ws"
+                "?model=saaras:v3"
+                "&mode=transcribe"
+                "&language-code=hi-IN"
+                "&sample_rate=8000"
+                "&input_audio_codec=pcm_s16le"
+                "&vad_signals=true"
+            )
+            self.ws = await websockets.connect(
+                url,
+                extra_headers={"api-subscription-key": self.api_key},
+                max_size=10 * 1024 * 1024,
+            )
+            self.running = True
+            self._listen_task = asyncio.create_task(self._listen())
+            logger.info("Sarvam streaming STT connected")
+            return True
+        except Exception as e:
+            logger.error(f"Sarvam streaming STT connect failed: {e}")
+            return False
+
+    async def _listen(self):
+        """Listen for transcripts from Sarvam."""
+        try:
+            async for msg in self.ws:
+                try:
+                    data = json.loads(msg)
+                    # Handle transcript
+                    if "transcript" in data:
+                        transcript = data.get("transcript", "")
+                        is_final = data.get("is_final", False)
+                        if transcript:
+                            await self.transcript_queue.put({
+                                "text": transcript,
+                                "is_final": is_final,
+                            })
+                    # Handle VAD signals
+                    elif data.get("type") == "vad":
+                        event = data.get("event", "")
+                        if event in ("END_SPEECH", "end_speech"):
+                            await self.transcript_queue.put({
+                                "type": "end_speech",
+                            })
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.error(f"STT listen error: {e}")
+        except Exception as e:
+            logger.error(f"STT listen loop ended: {e}")
+        finally:
+            self.running = False
+
+    async def send_audio(self, pcm16_bytes: bytes):
+        """Send audio chunk to Sarvam."""
+        if not self.ws or not self.running:
+            return
+        try:
+            # Sarvam expects base64-encoded audio
+            audio_b64 = base64.b64encode(pcm16_bytes).decode()
+            msg = json.dumps({
+                "audio": audio_b64,
+                "encoding": "pcm_s16le",
+                "sample_rate": 8000,
+            })
+            await self.ws.send(msg)
+        except Exception as e:
+            logger.error(f"STT send audio failed: {e}")
+
+    async def get_transcript(self, timeout: float = 0.1):
+        """Get next transcript (non-blocking with timeout)."""
+        try:
+            return await asyncio.wait_for(
+                self.transcript_queue.get(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return None
+
+    async def close(self):
+        """Close the connection."""
+        self.running = False
+        if self._listen_task:
+            self._listen_task.cancel()
+        if self.ws:
+            try:
+                await self.ws.close()
+            except:
+                pass
+        logger.info("Sarvam streaming STT closed")
 
 
 async def ask_gemini(user_text: str, history: list) -> str:
