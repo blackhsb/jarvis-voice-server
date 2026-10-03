@@ -61,7 +61,7 @@ async def answer(request: Request):
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream bidirectional="true" contentType="audio/x-mulaw;rate=8000">
+    <Stream bidirectional="true" audioTrack="inbound" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">
         {ws_url}
     </Stream>
 </Response>"""
@@ -256,22 +256,18 @@ def process_command(text: str, call_id: str) -> str:
 async def websocket_endpoint(websocket: WebSocket):
     """
     Bidirectional audio WebSocket for Vobiz Stream.
-    Vobiz sends: JSON with event types, audio as base64 mulaw
-    We send back: JSON with audio payload
+    Vobiz sends: start (with nested streamId/callId), media, playedStream, clearedAudio
+    We send back: playAudio, checkpoint, clearAudio, stop
     """
     await websocket.accept()
     call_id = f"call_{int(time.time())}"
     conversations[call_id] = []
+    stream_id = None
 
     logger.info(f"WebSocket connected: {call_id}")
 
-    # Send greeting immediately
-    greeting = "Namaste Harshit! Main Magnus hun, aapka personal assistant. Boliye, kya karna hai?"
-    await speak_text(websocket, greeting, call_id)
-
     # Audio buffer for incoming speech
     audio_buffer = bytearray()
-    silence_threshold = 0.5  # seconds of silence to trigger STT
     last_audio_time = time.time()
     is_speaking = False
 
@@ -282,7 +278,14 @@ async def websocket_endpoint(websocket: WebSocket):
             event = data.get("event")
 
             if event == "start":
-                logger.info(f"Stream started: {data.get('streamSid')}")
+                # IDs are NESTED: data.start.streamId, data.start.callId
+                start_data = data.get("start", {})
+                stream_id = start_data.get("streamId")
+                vobiz_call_id = start_data.get("callId")
+                logger.info(f"Stream started: streamId={stream_id}, callId={vobiz_call_id}")
+                # Send greeting AFTER start event (Vobiz is ready now)
+                greeting = "Namaste Harshit! Main Magnus hun, aapka personal assistant. Boliye, kya karna hai?"
+                await speak_text(websocket, greeting, call_id, stream_id)
                 continue
 
             elif event == "media":
@@ -295,12 +298,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_audio_time = time.time()
                     is_speaking = True
 
-            elif event == "stop":
-                logger.info("Stream stopped")
-                break
+            elif event == "playedStream":
+                logger.info(f"Audio played: {data.get('name')}")
+                continue
+
+            elif event == "clearedAudio":
+                logger.info("Audio cleared")
+                continue
 
             # Check for end of speech (silence detection - simplified)
-            # In production, use proper VAD
             if is_speaking and len(audio_buffer) > 8000:  # >0.5 sec of audio
                 silence_duration = time.time() - last_audio_time
                 if silence_duration > 1.0:  # 1 sec silence = end of utterance
@@ -316,7 +322,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         # LLM -> Response
                         response = process_command(text, call_id)
                         # TTS -> Speak
-                        await speak_text(websocket, response, call_id)
+                        await speak_text(websocket, response, call_id, stream_id)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {call_id}")
@@ -327,8 +333,8 @@ async def websocket_endpoint(websocket: WebSocket):
             del conversations[call_id]
 
 
-async def speak_text(websocket: WebSocket, text: str, call_id: str):
-    """Generate Sarvam TTS and stream to caller via WebSocket."""
+async def speak_text(websocket: WebSocket, text: str, call_id: str, stream_id: str = None):
+    """Generate Sarvam TTS and stream to caller via WebSocket using playAudio."""
     logger.info(f"Speaking: {text[:50]}...")
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
@@ -347,19 +353,33 @@ async def speak_text(websocket: WebSocket, text: str, call_id: str):
             return
 
         # Stream in chunks (20ms = 160 bytes at 8kHz mulaw)
+        # Vobiz expects: {event: "playAudio", media: {contentType, sampleRate, payload}}
         chunk_size = 160
         for i in range(0, len(mulaw_bytes), chunk_size):
             chunk = mulaw_bytes[i:i+chunk_size]
             payload = base64.b64encode(chunk).decode()
 
             msg = {
-                "event": "media",
-                "media": {"payload": payload}
+                "event": "playAudio",
+                "media": {
+                    "contentType": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "payload": payload
+                }
             }
             await websocket.send_text(json.dumps(msg))
 
             # Real-time pacing: 20ms per chunk
             await asyncio.sleep(0.02)
+
+        # Send checkpoint to mark end of utterance
+        if stream_id:
+            checkpoint_msg = {
+                "event": "checkpoint",
+                "streamId": stream_id,
+                "name": f"utterance_{int(time.time())}"
+            }
+            await websocket.send_text(json.dumps(checkpoint_msg))
 
         logger.info(f"Finished speaking ({len(mulaw_bytes)} bytes)")
 
