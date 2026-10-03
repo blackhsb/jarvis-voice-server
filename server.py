@@ -252,6 +252,22 @@ def process_command(text: str, call_id: str) -> str:
     return response
 
 
+def is_speech(pcm16_bytes: bytes, threshold: int = 500) -> bool:
+    """
+    Simple energy-based Voice Activity Detection.
+    Returns True if the audio frame contains speech (not silence).
+    """
+    import audioop
+    if not pcm16_bytes:
+        return False
+    # Calculate RMS energy of the audio frame
+    try:
+        rms = audioop.rms(pcm16_bytes, 2)  # 2 = 16-bit samples
+        return rms > threshold
+    except:
+        return False
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
@@ -294,9 +310,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if payload:
                     mulaw_bytes = base64.b64decode(payload)
                     pcm16 = mulaw_to_pcm16(mulaw_bytes)
-                    audio_buffer.extend(pcm16)
-                    last_audio_time = time.time()
-                    is_speaking = True
+                    # Only buffer and update speech timer if actual speech detected
+                    # (Vobiz sends media continuously, even during silence)
+                    if is_speech(pcm16):
+                        audio_buffer.extend(pcm16)
+                        last_audio_time = time.time()
+                        is_speaking = True
 
             elif event == "playedStream":
                 logger.info(f"Audio played: {data.get('name')}")
