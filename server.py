@@ -25,7 +25,7 @@ app = FastAPI(title="Jarvis Real-time Voice Server")
 
 # Config
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # e.g., https://xxx.ngrok-free.app
 VOBIZ_AUTH_ID = os.getenv("VOBIZ_AUTH_ID", "MA_0D6NBKHU")
 
@@ -215,41 +215,64 @@ def mp3_to_mulaw8k(mp3_path: str) -> bytes:
         return b""
 
 
-async def ask_grok(messages: list) -> str:
+async def ask_gemini(user_text: str, history: list) -> str:
     """
-    Call xAI Grok API for natural conversation.
+    Call Google Gemini API (free tier) for natural conversation.
     Returns the assistant's reply text.
     """
-    if not XAI_API_KEY:
-        logger.warning("XAI_API_KEY not set, LLM skipped")
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set, LLM skipped")
         return ""
 
     import httpx
     try:
+        # Build conversation context
+        system_prompt = (
+            "You are Jarvis, Harshit Singh's personal voice assistant. "
+            "You speak Hindi, English, and Hinglish naturally. "
+            "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
+            "Be warm, helpful, and a bit playful. "
+            "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
+            "and trades crypto (has 0.000059 BTC position). "
+            "Never mention you are an AI model. You are Jarvis."
+        )
+
+        # Build contents with history
+        contents = []
+        for msg in history[-8:]:  # Last 8 messages for context
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append({
+                "role": role,
+                "parts": [{"text": msg["content"]}]
+            })
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_text}]
+        })
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {XAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
                 json={
-                    "model": "grok-4-1-fast-non-reasoning",
-                    "messages": messages,
-                    "max_tokens": 150,  # Keep responses short for low latency
-                    "temperature": 0.7,
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": 100,  # Keep short for voice
+                        "temperature": 0.7,
+                    },
                 },
             )
             if resp.status_code == 200:
                 result = resp.json()
-                text = result["choices"][0]["message"]["content"].strip()
-                logger.info(f"Grok: {text[:80]}...")
+                text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                logger.info(f"Gemini: {text[:80]}...")
                 return text
             else:
-                logger.error(f"xAI Grok failed: {resp.status_code} {resp.text[:200]}")
+                logger.error(f"Gemini failed: {resp.status_code} {resp.text[:200]}")
                 return ""
     except Exception as e:
-        logger.error(f"Grok error: {e}")
+        logger.error(f"Gemini error: {e}")
         return ""
 
 
@@ -293,34 +316,14 @@ def process_command(text: str, call_id: str) -> str:
 
 async def process_command_llm(text: str, call_id: str) -> str:
     """
-    Process user speech using xAI Grok LLM with conversation history.
+    Process user speech using Google Gemini LLM with conversation history.
     Falls back to rule-based if LLM fails.
     """
     # Get conversation history
     history = conversations.get(call_id, [])
 
-    # Build messages for Grok with system prompt
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are Jarvis, Harshit Singh's personal voice assistant. "
-                "You speak Hindi, English, and Hinglish naturally. "
-                "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
-                "Be warm, helpful, and a bit playful. "
-                "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
-                "and trades crypto (has 0.000059 BTC position). "
-                "Never mention you are an AI model. You are Jarvis."
-            )
-        }
-    ]
-    # Add conversation history (last 10 messages to keep context small)
-    for msg in history[-10:]:
-        messages.append(msg)
-    messages.append({"role": "user", "content": text})
-
-    # Try Grok LLM
-    response = await ask_grok(messages)
+    # Try Gemini LLM
+    response = await ask_gemini(text, history)
     if response:
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": response})
@@ -328,7 +331,7 @@ async def process_command_llm(text: str, call_id: str) -> str:
         return response
 
     # Fallback to rule-based
-    logger.warning("Grok failed, using rule-based fallback")
+    logger.warning("Gemini failed, using rule-based fallback")
     return process_command(text, call_id)
 
 
