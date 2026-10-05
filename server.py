@@ -17,9 +17,11 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response, JSONResponse
 import uvicorn
+import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jarvis-realtime")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = FastAPI(title="Jarvis Real-time Voice Server")
 
@@ -122,7 +124,7 @@ async def transcribe_with_sarvam(audio_pcm16: bytes) -> str:
             if resp.status_code == 200:
                 result = resp.json()
                 text = result.get("transcript", "")
-                logger.info(f"STT: {text}")
+                logger.info("STT succeeded")
                 return text
             else:
                 logger.error(f"Sarvam STT failed: {resp.status_code} {resp.text[:200]}")
@@ -267,8 +269,7 @@ async def ask_gemini(user_text: str, history: list) -> str:
             "You speak Hindi, English, and Hinglish naturally. "
             "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
             "Be warm, helpful, and a bit playful. "
-            "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
-            "and trades crypto (has 0.000059 BTC position). "
+            "Do not assume current personal, financial or account facts. "
             f"Current live BTC price: {btc_price} INR. "
             "Use this when he asks about Bitcoin or crypto. "
             "Never mention you are an AI model. You are Jarvis."
@@ -289,8 +290,8 @@ async def ask_gemini(user_text: str, history: list) -> str:
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}",
-                headers={"Content-Type": "application/json"},
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
                 json={
                     "systemInstruction": {"parts": [{"text": system_prompt}]},
                     "contents": contents,
@@ -316,7 +317,7 @@ async def ask_gemini(user_text: str, history: list) -> str:
                     if not text:
                         logger.warning("Gemini: empty text")
                         return ""
-                    logger.info(f"Gemini: {text[:80]}...")
+                    logger.info("Gemini succeeded")
                     return text
                 except (KeyError, IndexError, AttributeError) as e:
                     logger.error(f"Gemini parse error: {e}, response: {str(result)[:200]}")
@@ -352,7 +353,7 @@ def process_command(text: str, call_id: str) -> str:
         now = datetime.now(ist)
         response = f"Abhi {now.strftime('%I:%M %p')} ho rahe hain."
     elif any(w in text_lower for w in ["bitcoin", "btc", "crypto"]):
-        response = "Aapka Bitcoin position khula hai. 0.000059 BTC, entry 84 lakh 3 hazaar. Stop 82 lakh 30 hazaar, target 86 lakh 90 hazaar."
+        response = "Mere paas aapki current Bitcoin position ya live market data verify karne ka access nahi hai."
     elif any(w in text_lower for w in ["bye", "alvida", "rakh", "cut"]):
         response = "Theek hai Harshit, phir baat karte hain. Bye!"
     elif text_lower:
@@ -383,8 +384,7 @@ async def ask_gemini_stream(user_text: str, history: list):
             "You speak Hindi, English, and Hinglish naturally. "
             "Keep responses SHORT (1-2 sentences max) for voice - they will be spoken aloud. "
             "Be warm, helpful, and a bit playful. "
-            "Harshit runs an agency (Blackhsbagency), a men's fashion Instagram (@blackhsbstlyin), "
-            "and trades crypto (has 0.000059 BTC position). "
+            "Do not assume current personal, financial or account facts. "
             f"Current live BTC price: {btc_price} INR. "
             "Use this when he asks about Bitcoin or crypto. "
             "Never mention you are an AI model. You are Jarvis."
@@ -406,8 +406,8 @@ async def ask_gemini_stream(user_text: str, history: list):
         async with httpx.AsyncClient(timeout=30.0) as client:
             async with client.stream(
                 "POST",
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:streamGenerateContent?key={GEMINI_API_KEY}&alt=sse",
-                headers={"Content-Type": "application/json"},
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:streamGenerateContent?alt=sse",
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
                 json={
                     "systemInstruction": {"parts": [{"text": system_prompt}]},
                     "contents": contents,
@@ -522,7 +522,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 vobiz_call_id = start_data.get("callId")
                 logger.info(f"Stream started: streamId={stream_id}, callId={vobiz_call_id}")
                 # Send greeting AFTER start event (Vobiz is ready now)
-                greeting = "Namaste Harshit! Main Magnus hun, aapka personal assistant. Boliye, kya karna hai?"
+                greeting = "Namaste Harshit! Main Jarvis hun, aapka personal assistant. Boliye, kya karna hai?"
                 await speak_text(websocket, greeting, call_id, stream_id)
                 continue
 
@@ -568,7 +568,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             if sentence:
                                 full_response += sentence + " "
                                 sentence_count += 1
-                                logger.info(f"Streaming sentence {sentence_count}: {sentence[:50]}...")
+                                logger.info(f"Streaming sentence {sentence_count}")
                                 await speak_text(websocket, sentence, call_id, stream_id)
 
                         # Update conversation history
@@ -593,7 +593,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
 async def speak_text(websocket: WebSocket, text: str, call_id: str, stream_id: str = None):
     """Generate Sarvam TTS and stream to caller via WebSocket using playAudio."""
-    logger.info(f"Speaking: {text[:50]}...")
+    if not stream_id:
+        logger.warning("Playback skipped: stream ID missing")
+        return
+    logger.info("Generating voice reply")
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
         mp3_path = tf.name
@@ -619,6 +622,7 @@ async def speak_text(websocket: WebSocket, text: str, call_id: str, stream_id: s
 
             msg = {
                 "event": "playAudio",
+                "streamId": stream_id,
                 "media": {
                     "contentType": "audio/x-mulaw",
                     "sampleRate": 8000,
